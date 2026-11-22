@@ -1,0 +1,2173 @@
+diff --git a/codex-rs/Cargo.lock b/codex-rs/Cargo.lock
+index 8b8bad583ab12cb0f6d7985dbfc92d3e660f29bc..507db14e9cffd7f80692736c52c706046aad4c10 100644
+--- a/codex-rs/Cargo.lock
++++ b/codex-rs/Cargo.lock
+@@ -4910,6 +4910,7 @@ dependencies = [
+  "regex",
+  "serde",
+  "serde_json",
++ "sha2 0.10.9",
+  "tempfile",
+  "time",
+  "tokio",
+diff --git a/codex-rs/app-server/src/request_processors/initialize_processor.rs b/codex-rs/app-server/src/request_processors/initialize_processor.rs
+index f6b282e7e107b4bfed3604b22cb2b372885c212b..262e37818aa7eccbdca7c2453fa0e567f4ff16ed 100644
+--- a/codex-rs/app-server/src/request_processors/initialize_processor.rs
++++ b/codex-rs/app-server/src/request_processors/initialize_processor.rs
+@@ -211,7 +211,23 @@ impl InitializeRequestProcessor {
+             }
+         }
+ 
+-        let user_agent = get_codex_user_agent();
++        let user_agent = if std::env::var_os("CODEX_STEWARD_CAS").is_some_and(|value| value == "1")
++        {
++            let patch = option_env!("CODEX_STEWARD_PATCH_SHA256")
++                .filter(|value| {
++                    value.len() == 64
++                        && value
++                            .bytes()
++                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
++                })
++                .unwrap_or("unattested");
++            format!(
++                "{} steward-cas-child-prefix-v1;scope=legacy,paginated;enabled=1;steward-patch={patch}",
++                get_codex_user_agent()
++            )
++        } else {
++            get_codex_user_agent()
++        };
+         let response = InitializeResponse {
+             user_agent,
+             codex_home,
+diff --git a/codex-rs/cli/src/main.rs b/codex-rs/cli/src/main.rs
+index c8e23b67352824b9842dcc3f15910ad7e81aecd7..a033c2903b2ed06507f5b72914dac4e130b5bd49 100644
+--- a/codex-rs/cli/src/main.rs
++++ b/codex-rs/cli/src/main.rs
+@@ -1045,6 +1045,37 @@ fn stage_str(stage: Stage) -> &'static str {
+ 
+ fn main() -> anyhow::Result<()> {
+     codex_build_info::initialize!();
++    if std::env::args_os()
++        .nth(1)
++        .is_some_and(|argument| argument == "--steward-export-rollout")
++    {
++        let arguments: Vec<_> = std::env::args_os().skip(2).collect();
++        if arguments.len() != 2 {
++            anyhow::bail!("--steward-export-rollout requires SOURCE and NEW_DESTINATION");
++        }
++        let checksum = codex_rollout::export_steward_cas_rollout(
++            std::path::Path::new(&arguments[0]),
++            std::path::Path::new(&arguments[1]),
++        )?;
++        println!(
++            "{}",
++            serde_json::json!({"plain_export_verified": true, "sha256": checksum})
++        );
++        return Ok(());
++    }
++    if std::env::args_os()
++        .nth(1)
++        .is_some_and(|argument| argument == "--steward-storage-self-test")
++    {
++        if std::env::args_os().count() != 2 {
++            anyhow::bail!("--steward-storage-self-test accepts no other arguments");
++        }
++        println!(
++            "{}",
++            serde_json::to_string_pretty(&codex_rollout::steward_storage_self_test()?)?
++        );
++        return Ok(());
++    }
+     let remote_control_disabled = codex_app_server::take_remote_control_disabled_env();
+     arg0_dispatch_or_else(move |arg0_paths: Arg0DispatchPaths| async move {
+         // Finish polling the large subcommand dispatcher before polling interactive TUI events.
+diff --git a/codex-rs/core/src/agent/control_tests.rs b/codex-rs/core/src/agent/control_tests.rs
+index b22f68fcedf4ca6315093f9d0b18f1cb61d96b88..20e0c7b7cdd13414e1b21c3753f5a02a9e1f3c01 100644
+--- a/codex-rs/core/src/agent/control_tests.rs
++++ b/codex-rs/core/src/agent/control_tests.rs
+@@ -211,6 +211,16 @@ fn rollout_response_item(item: ResponseItem) -> RolloutItem {
+     RolloutItem::ResponseItem(item.into())
+ }
+ 
++fn logical_rollout_lines(path: &std::path::Path) -> Vec<codex_rollout::RolloutLine> {
++    let mut reader =
++        codex_rollout::open_rollout_seekable_reader(path, || false).expect("open logical rollout");
++    let mut text = String::new();
++    std::io::Read::read_to_string(&mut reader, &mut text).expect("read logical rollout");
++    text.lines()
++        .map(|line| codex_rollout::parse_rollout_line(line).expect("parse rollout line"))
++        .collect()
++}
++
+ fn user_message(text: &str) -> ResponseItem {
+     ResponseItem::Message {
+         status: None,
+@@ -493,7 +503,7 @@ async fn persist_thread_for_tree_resume(thread: &Arc<CodexThread>, message: &str
+ 
+ /// Builds a request entirely in process; it does not install a transport or send anything.
+ /// The destination filtering behavior is covered separately in `client_tests`.
+-async fn mcp_attribution_in_constructed_request(thread: &CodexThread) -> McpAttribution {
++async fn constructed_response_request(thread: &CodexThread) -> codex_api::ResponsesApiRequest {
+     let turn_context = thread.session.new_default_turn().await;
+     let step_context = StepContext::for_test(Arc::clone(&turn_context));
+     let prompt = crate::session::turn::build_prompt(
+@@ -531,6 +541,11 @@ async fn mcp_attribution_in_constructed_request(thread: &CodexThread) -> McpAttr
+             /*include_internal*/ true,
+         )
+         .expect("construct request");
++    request
++}
++
++async fn mcp_attribution_in_constructed_request(thread: &CodexThread) -> McpAttribution {
++    let request = constructed_response_request(thread).await;
+     serde_json::from_str(
+         request
+             .client_metadata
+@@ -2551,11 +2566,7 @@ async fn spawn_agent_fork_from_paginated_parent_uses_model_context_prefix(
+     let rollout_path = child_thread
+         .rollout_path()
+         .expect("child rollout should exist");
+-    let lines = std::fs::read_to_string(&rollout_path)
+-        .expect("read child rollout")
+-        .lines()
+-        .map(|line| codex_rollout::parse_rollout_line(line).expect("parse rollout line"))
+-        .collect::<Vec<_>>();
++    let lines = logical_rollout_lines(&rollout_path);
+     let RolloutItem::SessionMeta(meta_line) = &lines[0].item else {
+         panic!("child rollout should start with session metadata");
+     };
+@@ -2850,11 +2861,7 @@ async fn spawn_agent_fork_sanitizes_inherited_compaction_metadata() {
+     let rollout_path = child_thread
+         .rollout_path()
+         .expect("child rollout should exist");
+-    let lines = std::fs::read_to_string(&rollout_path)
+-        .expect("read child rollout")
+-        .lines()
+-        .map(|line| codex_rollout::parse_rollout_line(line).expect("parse rollout line"))
+-        .collect::<Vec<_>>();
++    let lines = logical_rollout_lines(&rollout_path);
+     assert!(
+         !lines.iter().any(|line| {
+             matches!(
+@@ -3134,6 +3141,53 @@ async fn spawn_agent_can_fork_parent_thread_history_with_sanitized_items() {
+     );
+     let history = child_thread.session.clone_history().await;
+     let history_items = history.raw_items().cloned().collect::<Vec<_>>();
++    if std::env::var_os("CODEX_STEWARD_CAS").is_some_and(|value| value == "1") {
++        child_thread.ensure_rollout_materialized().await;
++        child_thread
++            .flush_rollout()
++            .await
++            .expect("flush legacy CAS child");
++        let path = child_thread.rollout_path().expect("legacy child rollout");
++        assert!(
++            codex_rollout::is_steward_cas_rollout(&path).expect("inspect native storage marker"),
++            "real legacy full-history spawn must select the native CAS writer"
++        );
++        let lines = logical_rollout_lines(&path);
++        let RolloutItem::SessionMeta(metadata) = &lines[0].item else {
++            panic!("logical legacy child must start with its canonical session metadata");
++        };
++        assert_eq!(metadata.meta.id, child_thread_id);
++        let boundary = usize::try_from(
++            metadata
++                .meta
++                .subagent_history_start_ordinal
++                .expect("legacy CAS child inherited boundary"),
++        )
++        .expect("bounded prefix length");
++        let inherited = &lines[1..boundary];
++        let inherited_items: Vec<_> = inherited
++            .iter()
++            .filter_map(|line| match &line.item {
++                RolloutItem::ResponseItem(item) => Some(item.item.clone()),
++                _ => None,
++            })
++            .collect();
++        assert_eq!(
++            strip_response_item_ids(&inherited_items),
++            strip_response_item_ids(&history_items),
++            "legacy CAS inherited bytes must reconstruct the live child context exactly once"
++        );
++        assert!(
++            lines.iter().all(|line| line.ordinal.is_none()),
++            "legacy CAS must not introduce persisted model-history ordinals"
++        );
++        assert!(
++            matches!(&lines[boundary].item,
++            RolloutItem::EventMsg(EventMsg::ThreadSettingsApplied(event))
++                if event.thread_id == Some(child_thread_id)),
++            "the first local record must be the original child settings after its inherited prefix"
++        );
++    }
+     let assistant_position = |history: &crate::context_manager::ContextManager| {
+         history.annotated_items().iter().find(|item| {
+             matches!(&item.item, ResponseItem::Message { role, phase: Some(MessagePhase::FinalAnswer), .. } if role == "assistant")
+@@ -4118,6 +4172,218 @@ async fn spawn_agent_full_fork_legacy_compaction_rebuilds_child_instructions_onc
+     }
+ }
+ 
++#[test_case::test_case(ThreadHistoryMode::Legacy, MultiAgentVersion::V1, false; "legacy_v1")]
++#[test_case::test_case(ThreadHistoryMode::Paginated, MultiAgentVersion::V1, false; "paginated_v1")]
++#[test_case::test_case(ThreadHistoryMode::Legacy, MultiAgentVersion::V2, false; "legacy_v2_filtered")]
++#[test_case::test_case(ThreadHistoryMode::Paginated, MultiAgentVersion::V2, false; "paginated_v2_filtered")]
++#[test_case::test_case(ThreadHistoryMode::Legacy, MultiAgentVersion::V2, true; "legacy_v2_preserved")]
++#[test_case::test_case(ThreadHistoryMode::Paginated, MultiAgentVersion::V2, true; "paginated_v2_preserved")]
++#[tokio::test]
++async fn steward_cas_cold_resume_preserves_constructed_model_input(
++    history_mode: ThreadHistoryMode,
++    version: MultiAgentVersion,
++    preserve_fork_prefix: bool,
++) {
++    let mut harness = AgentControlHarness::new().await;
++    if version == MultiAgentVersion::V2 {
++        harness
++            .config
++            .features
++            .enable(Feature::MultiAgentV2)
++            .unwrap();
++    } else {
++        harness
++            .config
++            .features
++            .disable(Feature::MultiAgentV2)
++            .unwrap();
++    }
++    harness.config.developer_instructions = Some("Parent developer context.".to_string());
++    let parent = harness
++        .manager
++        .start_thread(StartThreadOptions {
++            history_mode: Some(history_mode),
++            environments: Some(Vec::new()),
++            ..StartThreadOptions::new(harness.config.clone())
++        })
++        .await
++        .expect("start real parent");
++    let parent_id = parent.thread_id;
++    let turn = parent.thread.session.new_default_turn().await;
++    let spawn_call_id = "steward-cas-cold-spawn".to_string();
++    let mut developer = user_message("Parent developer context.");
++    if let ResponseItem::Message { role, .. } = &mut developer {
++        *role = "developer".to_string();
++    }
++    parent
++        .thread
++        .session
++        .persist_rollout_items(&[
++            RolloutItem::Compacted(Box::new(CompactedItem {
++                message: String::new(),
++                replacement_history: Some(vec![
++                    user_message("Root authorization A: inspect the supplied source.").into(),
++                    developer.into(),
++                    assistant_message("Parent final answer.", Some(MessagePhase::FinalAnswer))
++                        .into(),
++                    user_message("Root authorization B: retain every original byte.").into(),
++                ]),
++                retained_context: Some(codex_history::RetainedContext::default()),
++                guardian_history: Some(codex_history::GuardianHistoryCheckpoint(vec![
++                    user_message("PARENT_PRIVATE_APPROVAL_MUST_NOT_REAPPEAR").into(),
++                ])),
++                mcp_resource_origins: None,
++                window_number: Some(1),
++                first_window_id: None,
++                previous_window_id: None,
++                window_id: None,
++                compaction_response_id: None,
++                latest_token_usage_record: None,
++                resume_metadata: Some(codex_history::CompactionResumeMetadata {
++                    rejected_audio_file_ids: Default::default(),
++                    dynamic_tools: None,
++                    multi_agent_version: Some(version),
++                    last_started_turn_id: None,
++                    turn_attribution: None,
++                    previous_turn_settings: None,
++                }),
++            })),
++            RolloutItem::TurnContext(turn.to_turn_context_item()),
++            rollout_response_item(spawn_agent_call(&spawn_call_id)),
++        ])
++        .await;
++    parent.thread.ensure_rollout_materialized().await;
++    parent
++        .thread
++        .flush_rollout()
++        .await
++        .expect("flush compacted parent");
++    let mut child_config = harness.config.clone();
++    child_config.multi_agent_v2.preserve_fork_prefix = preserve_fork_prefix;
++    child_config.developer_instructions = Some("Child developer context.".to_string());
++    child_config.multi_agent_v2.subagent_developer_instructions =
++        Some("Child developer context.".to_string());
++    let child_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
++        parent_thread_id: parent_id,
++        depth: 1,
++        agent_path: None,
++        agent_nickname: None,
++        agent_role: None,
++    });
++    let child_id = harness
++        .control
++        .spawn_agent_with_metadata(
++            child_config.clone(),
++            text_input("child task"),
++            child_source.clone(),
++            SpawnAgentOptions {
++                parent_thread_id: Some(parent_id),
++                fork_parent_spawn_call_id: Some(spawn_call_id),
++                fork_mode: Some(SpawnAgentForkMode::FullHistory),
++                ..Default::default()
++            },
++        )
++        .await
++        .expect("spawn real full-history child")
++        .thread_id;
++    let child = harness
++        .manager
++        .get_thread(child_id)
++        .await
++        .expect("live child");
++    persist_thread_for_tree_resume(&child, "child durable local task").await;
++    let path = child.rollout_path().expect("durable child path");
++    let cas_enabled = std::env::var_os("CODEX_STEWARD_CAS").is_some_and(|value| value == "1");
++    assert_eq!(
++        codex_rollout::is_steward_cas_rollout(&path).expect("storage marker"),
++        cas_enabled,
++        "the real child must select CAS exactly when the opt-in is enabled"
++    );
++    let live_history = child.session.clone_history().await;
++    let expected_history = live_history.annotated_items().to_vec();
++    let expected_authorization =
++        serde_json::to_value(live_history.retained_context()).expect("live authorization");
++    let expected_guardian = serde_json::to_value(live_history.guardian_history_checkpoint())
++        .expect("live guardian context");
++    assert!(
++        !history_contains_text(
++            live_history.conversation_history_snapshot().review_items(),
++            "PARENT_PRIVATE_APPROVAL_MUST_NOT_REAPPEAR"
++        ),
++        "fork must sanitize parent-local review evidence"
++    );
++    let request = constructed_response_request(&child).await;
++    let expected_input = serde_json::to_vec(&request.input).expect("live constructed input bytes");
++    let first = request
++        .input
++        .iter()
++        .position(|item| history_contains_text([item], "Root authorization A:"))
++        .expect("first inherited user instruction");
++    let second = request
++        .input
++        .iter()
++        .position(|item| history_contains_text([item], "Root authorization B:"))
++        .expect("second inherited user instruction");
++    assert!(
++        first < second,
++        "inherited user instructions must retain their original order"
++    );
++    assert!(!history_contains_text(
++        request.input.iter(),
++        "PARENT_PRIVATE_APPROVAL_MUST_NOT_REAPPEAR"
++    ));
++    drop(live_history);
++    harness
++        .control
++        .shutdown_live_agent(child_id)
++        .await
++        .expect("shutdown and unload child");
++    assert!(harness.manager.get_thread(child_id).await.is_err());
++    drop(child);
++    let resumed_id = harness
++        .control
++        .resume_agent_from_rollout(child_config, child_id, child_source)
++        .await
++        .expect("cold resume child from its persisted CAS path");
++    assert_eq!(resumed_id, child_id);
++    let resumed = harness
++        .manager
++        .get_thread(child_id)
++        .await
++        .expect("cold resumed child");
++    assert_eq!(resumed.rollout_path().as_ref(), Some(&path));
++    let resumed_history = resumed.session.clone_history().await;
++    assert!(
++        resumed_history.annotated_items() == expected_history.as_slice(),
++        "cold resume must preserve exact model items, roles, IDs and inherited metadata"
++    );
++    assert_eq!(
++        serde_json::to_value(resumed_history.retained_context()).expect("resumed authorization"),
++        expected_authorization
++    );
++    assert_eq!(
++        serde_json::to_value(resumed_history.guardian_history_checkpoint())
++            .expect("resumed guardian context"),
++        expected_guardian
++    );
++    let resumed_request = constructed_response_request(&resumed).await;
++    assert!(
++        serde_json::to_vec(&resumed_request.input).expect("resumed constructed input bytes")
++            == expected_input,
++        "live and cold-resumed child must construct exactly the same serialized model input"
++    );
++    harness
++        .control
++        .shutdown_live_agent(child_id)
++        .await
++        .expect("shutdown resumed child");
++    parent
++        .thread
++        .shutdown_and_wait()
++        .await
++        .expect("shutdown parent");
++}
++
+ #[test_case::test_case(false; "complete")]
+ #[test_case::test_case(true; "error_reason")]
+ #[tokio::test]
+diff --git a/codex-rs/core/src/session/session.rs b/codex-rs/core/src/session/session.rs
+index c8d6395de3434c0cda9784c6cf732104fb137ca7..84b04ab6889dea0d886da3386efef974a2fcc1f1 100644
+--- a/codex-rs/core/src/session/session.rs
++++ b/codex-rs/core/src/session/session.rs
+@@ -1122,6 +1122,36 @@ impl Session {
+                             anyhow::anyhow!("new thread missing its initial window")
+                         })?;
+                         let auth = persistence_auth.await;
++                        // Keep the legacy child's single initialization append and mark
++                        // only the inherited records for the optional storage codec.
++                        let legacy_cas_prefix_start = if std::env::var_os("CODEX_STEWARD_CAS")
++                            .is_some_and(|value| value == "1")
++                            && session_configuration.history_mode == ThreadHistoryMode::Legacy
++                            && session_configuration.session_source.is_non_root_agent()
++                            && matches!(
++                                &fork_persistence,
++                                ForkPersistence::Copied | ForkPersistence::CopiedDeferred
++                            )
++                            && let InitialHistory::Forked(items) = &initial_history
++                        {
++                            let count = codex_rollout::persisted_rollout_items(
++                                items,
++                                session_configuration.history_mode,
++                            )
++                            .len();
++                            Some(
++                                u64::try_from(count)
++                                    .ok()
++                                    .and_then(|count| count.checked_add(1))
++                                    .ok_or_else(|| {
++                                        anyhow::anyhow!(
++                                            "inherited legacy model context is too large"
++                                        )
++                                    })?,
++                            )
++                        } else {
++                            None
++                        };
+                         let params = CreateThreadParams {
+                             attached_thread,
+                             creator_user_id: auth.as_ref().and_then(CodexAuth::get_chatgpt_user_id),
+@@ -1146,7 +1176,7 @@ impl Session {
+                                 ForkPersistence::Copied | ForkPersistence::CopiedDeferred => None,
+                                 ForkPersistence::Referenced { history_base, .. } => *history_base,
+                             },
+-                            subagent_history_start_ordinal: None,
++                            subagent_history_start_ordinal: legacy_cas_prefix_start,
+                             initial_window_id: ids
+                                 .initial_auto_compact_window_ids
+                                 .window_id
+diff --git a/codex-rs/rollout/Cargo.toml b/codex-rs/rollout/Cargo.toml
+index 93cdc4f235876dfefd1127142e2b9ee7a25a541e..383e4f5943501f0c1b8a4ac272918e6580723a92 100644
+--- a/codex-rs/rollout/Cargo.toml
++++ b/codex-rs/rollout/Cargo.toml
+@@ -32,6 +32,7 @@ memchr = { workspace = true }
+ regex = { workspace = true }
+ serde = { workspace = true, features = ["derive"] }
+ serde_json = { workspace = true }
++sha2 = { workspace = true }
+ tempfile = { workspace = true }
+ time = { workspace = true, features = [
+     "formatting",
+diff --git a/codex-rs/rollout/src/compression.rs b/codex-rs/rollout/src/compression.rs
+index 12b98375aa4900bc6127feee2f24f13834482928..755bf8642e06fe49d744dd1c7567724f9966839f 100644
+--- a/codex-rs/rollout/src/compression.rs
++++ b/codex-rs/rollout/src/compression.rs
+@@ -890,6 +890,15 @@ mod worker {
+         thread_id: codex_protocol::ThreadId,
+         trigger: RolloutCompressionTrigger,
+     ) -> io::Result<CompressionMeasurement> {
++        // The plain file is a required-CAS header plus local tail. Compressing that physical
++        // representation as ordinary JSONL would discard the inherited model context.
++        if crate::steward_cas::is_steward_cas_rollout(path)? {
++            return Ok(CompressionMeasurement::new(
++                CompressionOutcome::SkippedBusy,
++                None,
++                None,
++            ));
++        }
+         let before = match cold_file_state(path)
+             .inspect_err(|err| FailureMetric::File(trigger).record("read_metadata", err))?
+         {
+@@ -1435,6 +1444,19 @@ mod reader {
+             .inspect_err(|err| metrics.failed("open", ReadFailureSource::TaskJoin, err))??;
+             return Ok(RolloutLineReaderInner::Blocking(Some(reader)));
+         }
++        if super::super::steward_cas::is_steward_cas_rollout(&path)? {
++            metrics.format = "steward_cas_v1";
++            let reader = tokio::task::spawn_blocking(move || {
++                let reader = super::super::steward_cas::logical_snapshot(&path, || false)?
++                    .ok_or_else(|| io::Error::other("CAS rollout changed representation"))?;
++                Ok::<_, io::Error>(
++                    io::BufReader::new(Box::new(reader) as Box<dyn Read + Send>).lines(),
++                )
++            })
++            .await
++            .map_err(io::Error::other)??;
++            return Ok(RolloutLineReaderInner::Blocking(Some(reader)));
++        }
+         metrics.format = "plain";
+         let file = tokio::fs::File::open(path).await?;
+         Ok(RolloutLineReaderInner::Plain(
+diff --git a/codex-rs/rollout/src/lib.rs b/codex-rs/rollout/src/lib.rs
+index f1723371071dbf611efc7b4d5478ff8a521aa055..847c9402adb80571b6e53f7f8e507e662ca9d166 100644
+--- a/codex-rs/rollout/src/lib.rs
++++ b/codex-rs/rollout/src/lib.rs
+@@ -24,8 +24,14 @@ mod seekable_reader;
+ pub(crate) mod session_index;
+ mod sqlite_metrics;
+ pub mod state_db;
++mod steward_cas;
+ mod writer_lock;
+ 
++pub use steward_cas::export_steward_cas_rollout;
++pub use steward_cas::is_steward_cas_rollout;
++pub use steward_cas::steward_cas_revision;
++pub use steward_cas::steward_storage_self_test;
++
+ pub use codex_history::CompactedItem;
+ pub use codex_history::CompactionResumeMetadata;
+ pub use codex_history::InitialHistory;
+diff --git a/codex-rs/rollout/src/ordinal.rs b/codex-rs/rollout/src/ordinal.rs
+index 29a151cfaf2fef31f1a0444c97bea8c75f8563d3..9f37fd2414816108e6214ff93d642b7644a19ff9 100644
+--- a/codex-rs/rollout/src/ordinal.rs
++++ b/codex-rs/rollout/src/ordinal.rs
+@@ -56,6 +56,14 @@ pub(crate) fn ordinal_state_for_rollout(
+     file: &mut File,
+     path: &Path,
+ ) -> io::Result<RolloutOrdinalState> {
++    let mut logical;
++    let file = if let Some(snapshot) = crate::steward_cas::logical_snapshot(path, || false)? {
++        crate::steward_cas::assert_prefix_complete(path)?;
++        logical = snapshot;
++        &mut logical
++    } else {
++        file
++    };
+     let Some((history_mode, subagent_history_start_ordinal)) = read_history_metadata(file, path)?
+     else {
+         return Ok(RolloutOrdinalState::Legacy);
+diff --git a/codex-rs/rollout/src/recorder.rs b/codex-rs/rollout/src/recorder.rs
+index b4b8bda7f94fccff79d7b434692bc8f26b3c22b6..35e39248c55c5341ea754de661c88b5bf9541ee8 100644
+--- a/codex-rs/rollout/src/recorder.rs
++++ b/codex-rs/rollout/src/recorder.rs
+@@ -1029,13 +1029,18 @@ impl RolloutRecorder {
+                     rollout_path: path,
+                     ordinal_state,
+                     last_logged_error: None,
++                    cas_record_ordinal: 1,
+                 }
+             }
+             RolloutRecorderParams::Resume { path } => {
+                 let (path, file, ordinal_state) =
+                     open_rollout_for_append(path.as_path(), writer_lock.clone()).await?;
+                 RolloutWriterState {
+-                    writer: Some(JsonlWriter { file }),
++                    writer: Some(JsonlWriter {
++                        file,
++                        path: path.clone(),
++                        cas_prefix_end: crate::steward_cas::prefix_end(&path)?,
++                    }),
+                     deferred_creation: false,
+                     pending_items: Vec::new(),
+                     realtime_sync_pending: false,
+@@ -1046,6 +1051,7 @@ impl RolloutRecorder {
+                     rollout_path: path,
+                     ordinal_state,
+                     last_logged_error: None,
++                    cas_record_ordinal: u64::MAX,
+                 }
+             }
+         };
+@@ -1789,6 +1795,9 @@ struct RolloutWriterState {
+     rollout_path: PathBuf,
+     ordinal_state: RolloutOrdinalState,
+     last_logged_error: Option<String>,
++    /// Storage sequence survives reopening after an I/O error, including legacy histories
++    /// whose logical records intentionally have no persisted ordinal field.
++    cas_record_ordinal: u64,
+ }
+ 
+ impl RolloutWriterState {
+@@ -1896,8 +1905,15 @@ impl RolloutWriterState {
+             self.directories_to_sync = rollout_directories_to_sync(&self.rollout_path)?;
+         }
+         let file = open_log_file(self.rollout_path.as_path())?;
++        let cas_prefix_end = crate::steward_cas::prefix_end(&self.rollout_path)?.or_else(|| {
++            self.meta
++                .as_ref()
++                .and_then(|meta| new_cas_prefix_end(meta, crate::steward_cas::enabled()))
++        });
+         self.writer = Some(JsonlWriter {
+             file: tokio::fs::File::from_std(file),
++            path: self.rollout_path.clone(),
++            cas_prefix_end,
+         });
+         self.deferred_creation = false;
+         Ok(())
+@@ -1939,8 +1955,18 @@ impl RolloutWriterState {
+         let mut write_result = Ok(());
+         for item in &self.pending_items {
+             match self.ordinal_state.current() {
+-                Ok(ordinal) => match writer.write_rollout_item(item, ordinal).await {
+-                    Ok(()) => self.ordinal_state.advance(),
++                Ok(ordinal) => match writer
++                    .write_rollout_item_with_storage_ordinal(
++                        item,
++                        ordinal,
++                        Some(ordinal.unwrap_or(self.cas_record_ordinal)),
++                    )
++                    .await
++                {
++                    Ok(()) => {
++                        self.ordinal_state.advance();
++                        self.cas_record_ordinal = self.cas_record_ordinal.saturating_add(1);
++                    }
+                     Err(err) => {
+                         write_result = Err(err);
+                         break;
+@@ -2029,7 +2055,9 @@ async fn write_session_meta(
+     let rollout_item = RolloutItem::SessionMeta(Box::new(session_meta_line));
+     if let Some(writer) = writer.as_mut() {
+         let ordinal = ordinal_state.current()?;
+-        writer.write_rollout_item(&rollout_item, ordinal).await?;
++        writer
++            .write_rollout_item_with_storage_ordinal(&rollout_item, ordinal, Some(0))
++            .await?;
+         ordinal_state.advance();
+     }
+     Ok(())
+@@ -2047,7 +2075,11 @@ pub async fn append_rollout_item_to_path(
+     let (_rollout_path, file, ordinal_state) =
+         open_rollout_for_append(rollout_path, /*writer_lock*/ None).await?;
+     let ordinal = ordinal_state.current()?;
+-    let mut writer = JsonlWriter { file };
++    let mut writer = JsonlWriter {
++        file,
++        path: _rollout_path.clone(),
++        cas_prefix_end: crate::steward_cas::prefix_end(&_rollout_path)?,
++    };
+     writer.write_rollout_item(item, ordinal).await
+ }
+ 
+@@ -2092,8 +2124,17 @@ fn ensure_rollout_is_newline_terminated(file: &mut File) -> std::io::Result<()>
+     Ok(())
+ }
+ 
++fn new_cas_prefix_end(meta: &SessionMeta, enabled: bool) -> Option<u64> {
++    (enabled && meta.history_base.is_none())
++        .then_some(meta.subagent_history_start_ordinal)
++        .flatten()
++        .filter(|end| *end > 1)
++}
++
+ struct JsonlWriter {
+     file: tokio::fs::File,
++    path: PathBuf,
++    cas_prefix_end: Option<u64>,
+ }
+ 
+ #[derive(serde::Serialize)]
+@@ -2110,6 +2151,20 @@ impl JsonlWriter {
+         &mut self,
+         rollout_item: &RolloutItem,
+         ordinal: Option<u64>,
++    ) -> std::io::Result<()> {
++        self.write_rollout_item_with_storage_ordinal(
++            rollout_item,
++            ordinal,
++            ordinal.or(self.cas_prefix_end),
++        )
++        .await
++    }
++
++    async fn write_rollout_item_with_storage_ordinal(
++        &mut self,
++        rollout_item: &RolloutItem,
++        ordinal: Option<u64>,
++        storage_ordinal: Option<u64>,
+     ) -> std::io::Result<()> {
+         let timestamp_format: &[FormatItem] = format_description!(
+             "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z"
+@@ -2123,13 +2178,51 @@ impl JsonlWriter {
+             ordinal,
+             item: rollout_item,
+         };
+-        self.write_line(&line).await
++        self.write_line(&line, storage_ordinal).await
+     }
+-    async fn write_line(&mut self, item: &impl serde::Serialize) -> std::io::Result<()> {
++    async fn write_line(
++        &mut self,
++        item: &impl serde::Serialize,
++        ordinal: Option<u64>,
++    ) -> std::io::Result<()> {
+         let mut json = serde_json::to_string(item)?;
+         json.push('\n');
++        if let Some(end) = self.cas_prefix_end {
++            let ordinal = ordinal
++                .ok_or_else(|| IoError::other("CAS storage requires its record sequence"))?;
++            if ordinal == 0 {
++                let path = self.path.clone();
++                let original = json.clone();
++                if tokio::task::spawn_blocking(move || {
++                    crate::steward_cas::header_already_published(&path, &original, end)
++                })
++                .await
++                .map_err(IoError::other)??
++                {
++                    return Ok(());
++                }
++                json = crate::steward_cas::wrap_session_meta(&json, end)?;
++            } else if ordinal < end {
++                let path = self.path.clone();
++                return tokio::task::spawn_blocking(move || {
++                    crate::steward_cas::append_prefix(&path, ordinal, &json)
++                })
++                .await
++                .map_err(IoError::other)?;
++            } else {
++                let path = self.path.clone();
++                tokio::task::spawn_blocking(move || {
++                    crate::steward_cas::assert_prefix_complete(&path)
++                })
++                .await
++                .map_err(IoError::other)??;
++            }
++        }
+         self.file.write_all(json.as_bytes()).await?;
+         self.file.flush().await?;
++        if self.cas_prefix_end.is_some() && ordinal == Some(0) {
++            self.file.sync_all().await?;
++        }
+         Ok(())
+     }
+ }
+diff --git a/codex-rs/rollout/src/recorder_tests.rs b/codex-rs/rollout/src/recorder_tests.rs
+index efcc6d4dcb82ed871538ce12b3c541a9e6e2a0d0..e7b45f8c5ba486031ef3886c7d4a289f2f87f56d 100644
+--- a/codex-rs/rollout/src/recorder_tests.rs
++++ b/codex-rs/rollout/src/recorder_tests.rs
+@@ -75,6 +75,189 @@ fn agent_message_item(message: &str) -> RolloutItem {
+     }))
+ }
+ 
++#[tokio::test]
++async fn steward_cas_recorder_reopens_and_preserves_logical_offsets() -> std::io::Result<()> {
++    let home = TempDir::new()?;
++    let directory = home.path().join("sessions/2026/11/08");
++    fs::create_dir_all(&directory)?;
++    let path = directory.join(format!(
++        "rollout-2026-11-08T00-00-00-{}.jsonl",
++        ThreadId::new()
++    ));
++    let file = tokio::fs::File::create(&path).await?;
++    let mut writer = JsonlWriter {
++        file,
++        path: path.clone(),
++        cas_prefix_end: Some(3),
++    };
++    let mut metadata = paginated_session_meta_item(ThreadId::new(), home.path());
++    if let RolloutItem::SessionMeta(metadata) = &mut metadata {
++        metadata.meta.subagent_history_start_ordinal = Some(3);
++    }
++    writer.write_rollout_item(&metadata, Some(0)).await?;
++    writer
++        .write_rollout_item(
++            &agent_message_item(&"inherited payload λ".repeat(8192)),
++            Some(1),
++        )
++        .await?;
++    writer
++        .write_rollout_item(
++            &agent_message_item("inherited authorization ordering"),
++            Some(2),
++        )
++        .await?;
++    writer
++        .write_rollout_item(&agent_message_item("child's own tail"), Some(3))
++        .await?;
++    drop(writer);
++
++    let mut logical = crate::open_rollout_seekable_reader(&path, || false)?;
++    let mut expected = Vec::new();
++    std::io::Read::read_to_end(&mut logical, &mut expected)?;
++    assert!(crate::rollout_contains_prefix(
++        &path,
++        expected.len() as u64,
++        || false
++    )?);
++    assert!(!crate::rollout_contains_prefix(
++        &path,
++        expected.len() as u64 + 1,
++        || false
++    )?);
++    assert_eq!(
++        crate::read_rollout_prefix(&path, 111)?,
++        Some(expected[..111].to_vec())
++    );
++    let mut scanner =
++        crate::ReverseJsonlScanner::new(crate::open_rollout_seekable_reader(&path, || false)?)?;
++    match scanner.scan_next_rollout_line()?.unwrap() {
++        crate::ScanOutcome::Parsed(record) => assert_eq!(record.ordinal, Some(3)),
++        _ => panic!("native reverse reader rejected logical CAS tail"),
++    }
++    let mut reader = crate::open_rollout_line_reader(&path).await?;
++    let mut lines = 0;
++    while reader.next_line().await?.is_some() {
++        lines += 1;
++    }
++    assert_eq!(lines, 4);
++    let (_path, file, state) = open_rollout_for_append(&path, None).await?;
++    assert_eq!(state.current()?, Some(4));
++    let mut resumed = JsonlWriter {
++        file,
++        path: path.clone(),
++        cas_prefix_end: crate::steward_cas::prefix_end(&path)?,
++    };
++    resumed
++        .write_rollout_item(&agent_message_item("cold resumed tail"), state.current()?)
++        .await?;
++    let history = RolloutRecorder::load_rollout_items(&path).await?.0;
++    assert_eq!(history.len(), 5);
++    assert!(matches!(&history[0], RolloutItem::SessionMeta(_)));
++    Ok(())
++}
++
++#[tokio::test]
++async fn steward_cas_recorder_legacy_keeps_logical_records_without_ordinals() -> std::io::Result<()>
++{
++    let home = TempDir::new()?;
++    let directory = home.path().join("sessions/2026/11/08");
++    fs::create_dir_all(&directory)?;
++    let path = directory.join("rollout-legacy.jsonl");
++    let mut writer = JsonlWriter {
++        file: tokio::fs::File::create(&path).await?,
++        path: path.clone(),
++        cas_prefix_end: Some(2),
++    };
++    let mut metadata = paginated_session_meta_item(ThreadId::new(), home.path());
++    if let RolloutItem::SessionMeta(metadata) = &mut metadata {
++        metadata.meta.history_mode = ThreadHistoryMode::Legacy;
++        metadata.meta.subagent_history_start_ordinal = Some(2);
++    }
++    writer
++        .write_rollout_item_with_storage_ordinal(&metadata, None, Some(0))
++        .await?;
++    writer
++        .write_rollout_item_with_storage_ordinal(
++            &agent_message_item("legacy inherited context"),
++            None,
++            Some(1),
++        )
++        .await?;
++    writer
++        .write_rollout_item(&agent_message_item("legacy child tail"), None)
++        .await?;
++    drop(writer);
++    let mut reader = crate::open_rollout_line_reader(&path).await?;
++    let mut lines = 0;
++    while let Some(line) = reader.next_line().await? {
++        assert_eq!(crate::parse_rollout_line(&line)?.ordinal, None);
++        lines += 1;
++    }
++    assert_eq!(lines, 3);
++    let (_path, file, state) = open_rollout_for_append(&path, None).await?;
++    assert_eq!(state.current()?, None);
++    let mut resumed = JsonlWriter {
++        file,
++        path: path.clone(),
++        cas_prefix_end: Some(2),
++    };
++    resumed
++        .write_rollout_item(&agent_message_item("legacy cold resumed tail"), None)
++        .await?;
++    assert_eq!(RolloutRecorder::load_rollout_items(&path).await?.0.len(), 4);
++    Ok(())
++}
++
++#[tokio::test]
++async fn steward_cas_recorder_header_retry_after_lost_acknowledgement_is_idempotent()
++-> std::io::Result<()> {
++    let home = TempDir::new()?;
++    let directory = home.path().join("sessions/2026/11/08");
++    fs::create_dir_all(&directory)?;
++    let path = directory.join("rollout-header-retry.jsonl");
++    let metadata = paginated_session_meta_item(ThreadId::new(), home.path());
++    let mut writer = JsonlWriter {
++        file: tokio::fs::File::create(&path).await?,
++        path: path.clone(),
++        cas_prefix_end: Some(2),
++    };
++    writer.write_rollout_item(&metadata, Some(0)).await?;
++    let first_header = fs::read(&path)?;
++    // Recreate the state after bytes reached disk but a flush/sync acknowledgement was lost.
++    drop(writer);
++    let mut retry = JsonlWriter {
++        file: tokio::fs::File::from_std(open_log_file(&path)?),
++        path: path.clone(),
++        cas_prefix_end: Some(2),
++    };
++    retry.write_rollout_item(&metadata, Some(0)).await?;
++    assert_eq!(fs::read(&path)?, first_header);
++    retry
++        .write_rollout_item(&agent_message_item("inherited"), Some(1))
++        .await?;
++    retry
++        .write_rollout_item(&agent_message_item("tail"), Some(2))
++        .await?;
++    assert_eq!(RolloutRecorder::load_rollout_items(&path).await?.0.len(), 3);
++    Ok(())
++}
++
++#[test]
++fn steward_cas_recorder_reference_backed_revert_never_creates_a_new_cas_prefix() {
++    let mut meta = SessionMeta::default();
++    meta.history_mode = ThreadHistoryMode::Paginated;
++    meta.subagent_history_start_ordinal = Some(3);
++    assert_eq!(new_cas_prefix_end(&meta, true), Some(3));
++    assert_eq!(new_cas_prefix_end(&meta, false), None);
++    meta.history_base = Some(HistoryPosition {
++        thread_id: ThreadId::new(),
++        end_ordinal_exclusive: 10,
++        end_byte_offset: 1000,
++    });
++    assert_eq!(new_cas_prefix_end(&meta, true), None);
++}
++
+ fn write_paginated_rollout(
+     path: &Path,
+     thread_id: ThreadId,
+@@ -1091,6 +1274,8 @@ async fn writer_state_retries_write_error_before_reporting_flush_success() -> st
+     let mut state = RolloutWriterState {
+         writer: Some(JsonlWriter {
+             file: tokio::fs::File::from_std(read_only_file),
++            path: rollout_path.clone(),
++            cas_prefix_end: None,
+         }),
+         deferred_creation: false,
+         realtime_sync_pending: false,
+@@ -1102,6 +1287,7 @@ async fn writer_state_retries_write_error_before_reporting_flush_success() -> st
+         rollout_path: rollout_path.clone(),
+         ordinal_state: RolloutOrdinalState::Legacy,
+         last_logged_error: None,
++        cas_record_ordinal: 1,
+     };
+     state.add_items(vec![RolloutItem::EventMsg(EventMsg::AgentMessage(
+         AgentMessageEvent {
+diff --git a/codex-rs/rollout/src/seekable_reader.rs b/codex-rs/rollout/src/seekable_reader.rs
+index a72617aeaab43a8d28cd50a55b7bcc640b200447..6e80e7b42ccf5754efa0fd3cecf52965fbef7b6d 100644
+--- a/codex-rs/rollout/src/seekable_reader.rs
++++ b/codex-rs/rollout/src/seekable_reader.rs
+@@ -57,7 +57,11 @@ pub fn read_rollout_prefix(path: &Path, max_bytes: usize) -> io::Result<Option<V
+         return Ok(None);
+     }
+     let reader: Box<dyn Read> = match source {
+-        RolloutReader::Plain(file) => Box::new(file),
++        RolloutReader::Plain(file) => Box::new(crate::steward_cas::open_logical_file(
++            &plain_rollout_path(path),
++            file,
++            || false,
++        )?),
+         RolloutReader::Compressed(file) => Box::new(zstd::stream::read::Decoder::new(file)?),
+     };
+     let mut bytes = Vec::new();
+@@ -79,7 +83,9 @@ pub fn open_rollout_seekable_reader(
+         return Err(io::Error::other("rollout read cancelled"));
+     }
+     let file = match RolloutReader::open(path)? {
+-        RolloutReader::Plain(file) => file,
++        RolloutReader::Plain(file) => {
++            crate::steward_cas::open_logical_file(&plain_rollout_path(path), file, &is_cancelled)?
++        }
+         RolloutReader::Compressed(file) => {
+             let mut decoded = tempfile::tempfile()?;
+             // Empty and skippable frames can consume input without producing decoded bytes.
+@@ -148,7 +154,14 @@ pub fn rollout_contains_prefix(
+         return Err(io::Error::other("rollout read cancelled"));
+     }
+     match RolloutReader::open(path)? {
+-        RolloutReader::Plain(file) => Ok(end_byte_offset <= file.metadata()?.len()),
++        RolloutReader::Plain(file) => {
++            let logical = crate::steward_cas::open_logical_file(
++                &plain_rollout_path(path),
++                file,
++                &is_cancelled,
++            )?;
++            Ok(end_byte_offset <= logical.metadata()?.len())
++        }
+         RolloutReader::Compressed(file) => {
+             let mut file = CancellableReader {
+                 inner: file,
+diff --git a/codex-rs/rollout/src/steward_cas.rs b/codex-rs/rollout/src/steward_cas.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..e20acb3af2fa448fc4b511ebf923e533fb475b67
+--- /dev/null
++++ b/codex-rs/rollout/src/steward_cas.rs
+@@ -0,0 +1,534 @@
++//! Experimental exact-byte storage for a subagent's inherited context.
++//!
++//! Model context is transformed by the existing agent code before this boundary. We store
++//! opaque serialized bytes, never interpret or summarize role or authorization content.
++//! The physical first record deliberately is not a SessionMeta: an unpatched reader must
++//! not mistake the child's local tail for its complete history.
++
++use std::fs::File;
++use std::io;
++use std::io::BufRead;
++use std::io::BufReader;
++use std::io::Read;
++use std::io::Seek;
++use std::io::SeekFrom;
++use std::io::Write;
++use std::path::Path;
++use std::path::PathBuf;
++
++use serde::Deserialize;
++use serde::Serialize;
++use sha2::Digest;
++use sha2::Sha256;
++
++const MARKER: &[u8] = b"{\"steward_cas_v1\":";
++const MAX_HEADER_BYTES: u64 = 16 * 1024 * 1024;
++const MAX_MANIFEST_BYTES: u64 = 128 * 1024 * 1024;
++const MAX_BLOB_LOGICAL_BYTES: u64 = 512 * 1024 * 1024;
++
++#[derive(Deserialize, Serialize)]
++#[serde(deny_unknown_fields)]
++struct HeaderEnvelope {
++    steward_cas_v1: Header,
++}
++
++#[derive(Deserialize, Serialize)]
++#[serde(deny_unknown_fields)]
++struct Header {
++    logical_session_meta: String,
++    prefix_end_ordinal: u64,
++}
++
++#[derive(Deserialize, Serialize)]
++#[serde(deny_unknown_fields)]
++struct Record {
++    ordinal: u64,
++    literal: String,
++    sha256: String,
++    bytes: u64,
++    #[serde(default)]
++    codec: BlobCodec,
++    #[serde(default)]
++    stored_bytes: Option<u64>,
++}
++
++#[derive(Clone, Copy, Default, Deserialize, Serialize)]
++#[serde(rename_all = "snake_case")]
++enum BlobCodec {
++    #[default]
++    Raw,
++    Zstd,
++}
++
++fn invalid(message: &str) -> io::Error {
++    io::Error::new(io::ErrorKind::InvalidData, message)
++}
++
++fn digest(bytes: &[u8]) -> String {
++    format!("{:x}", Sha256::digest(bytes))
++}
++
++fn paths(path: &Path) -> io::Result<(PathBuf, PathBuf)> {
++    let name = path
++        .file_name()
++        .ok_or_else(|| invalid("CAS rollout has no filename"))?;
++    let home = path
++        .ancestors()
++        .find_map(|ancestor| {
++            matches!(
++                ancestor.file_name().and_then(|name| name.to_str()),
++                Some("sessions" | "archived_sessions")
++            )
++            .then(|| ancestor.parent())
++            .flatten()
++        })
++        .ok_or_else(|| invalid("CAS rollout is outside a Codex sessions directory"))?;
++    let root = home.join("steward-cas-v1");
++    let manifest = root
++        .join("prefixes")
++        .join(name)
++        .with_extension("jsonl.prefix");
++    Ok((root.join("blobs"), manifest))
++}
++
++fn header(file: &mut File) -> io::Result<Option<(Header, u64)>> {
++    file.rewind()?;
++    let mut marker = [0; MARKER.len()];
++    let count = file.read(&mut marker)?;
++    file.rewind()?;
++    if count != marker.len() || marker != MARKER {
++        return Ok(None);
++    }
++    let mut line = String::new();
++    BufReader::new(file.take(MAX_HEADER_BYTES)).read_line(&mut line)?;
++    if !line.ends_with('\n') {
++        return Err(invalid("CAS rollout header is incomplete or oversized"));
++    }
++    let envelope: HeaderEnvelope = serde_json::from_str(&line)?;
++    let header = envelope.steward_cas_v1;
++    if header.prefix_end_ordinal < 2 || !header.logical_session_meta.ends_with('\n') {
++        return Err(invalid("invalid CAS rollout header"));
++    }
++    Ok(Some((header, line.len() as u64)))
++}
++
++/// Whether a rollout requires the Steward reader. Errors must not be treated as plain history.
++pub fn is_steward_cas_rollout(path: &Path) -> io::Result<bool> {
++    Ok(header(&mut File::open(path)?)?.is_some())
++}
++
++pub(crate) fn enabled() -> bool {
++    std::env::var_os("CODEX_STEWARD_CAS").is_some_and(|value| value == "1")
++}
++
++pub(crate) fn wrap_session_meta(json: &str, prefix_end_ordinal: u64) -> io::Result<String> {
++    let mut wrapped = serde_json::to_string(&HeaderEnvelope {
++        steward_cas_v1: Header {
++            logical_session_meta: json.to_owned(),
++            prefix_end_ordinal,
++        },
++    })?;
++    wrapped.push('\n');
++    Ok(wrapped)
++}
++
++/// A flush/sync acknowledgement can fail after the complete header was written. Retrying
++/// preserves that first header and timestamp instead of appending another physical header.
++pub(crate) fn header_already_published(
++    path: &Path,
++    logical_session_meta: &str,
++    prefix_end_ordinal: u64,
++) -> io::Result<bool> {
++    let mut file = File::options().read(true).write(true).open(path)?;
++    if file.metadata()?.len() == 0 {
++        return Ok(false);
++    }
++    let (existing, physical_end) =
++        header(&mut file)?.ok_or_else(|| invalid("new CAS storage requires an empty rollout"))?;
++    fn item_suffix(line: &str) -> &str {
++        line.find(",\"type\":")
++            .map(|split| &line[split..])
++            .unwrap_or(line)
++    }
++    if existing.prefix_end_ordinal != prefix_end_ordinal
++        || item_suffix(&existing.logical_session_meta) != item_suffix(logical_session_meta)
++        || file.metadata()?.len() != physical_end
++    {
++        return Err(invalid(
++            "CAS metadata retry does not match its original header",
++        ));
++    }
++    file.sync_all()?;
++    Ok(true)
++}
++
++pub(crate) fn prefix_end(path: &Path) -> io::Result<Option<u64>> {
++    Ok(header(&mut File::open(path)?)?.map(|(header, _)| header.prefix_end_ordinal))
++}
++
++fn read_records(manifest: &Path) -> io::Result<Vec<Record>> {
++    let file = File::open(manifest)?;
++    if file.metadata()?.len() > MAX_MANIFEST_BYTES {
++        return Err(invalid("CAS prefix manifest is oversized"));
++    }
++    let mut records = Vec::new();
++    for line in BufReader::new(file).split(b'\n') {
++        let line = line?;
++        if line.is_empty() {
++            continue;
++        }
++        let record: Record = serde_json::from_slice(&line)?;
++        if record.ordinal != records.len() as u64 + 1
++            || record.sha256.len() != 64
++            || !record
++                .sha256
++                .bytes()
++                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
++        {
++            return Err(invalid("CAS prefix manifest has invalid ordinal or hash"));
++        }
++        records.push(record);
++    }
++    // A missing final newline is an interrupted publication, never valid EOF.
++    let mut file = File::open(manifest)?;
++    if file.metadata()?.len() != 0 {
++        file.seek(SeekFrom::End(-1))?;
++        let mut last = [0];
++        file.read_exact(&mut last)?;
++        if last != [b'\n'] {
++            return Err(invalid("CAS prefix manifest has a partial final record"));
++        }
++    }
++    Ok(records)
++}
++
++fn sync_directory(path: &Path) -> io::Result<()> {
++    #[cfg(unix)]
++    File::open(path)?.sync_all()?;
++    // Windows directory handles require platform-specific opening flags. Blob and manifest
++    // files are synced there; power-loss directory durability remains an explicit release gate.
++    #[cfg(not(unix))]
++    let _ = path;
++    Ok(())
++}
++
++fn blob_path(root: &Path, record: &Record) -> PathBuf {
++    match record.codec {
++        BlobCodec::Raw => root.join(&record.sha256),
++        BlobCodec::Zstd => root.join(format!("{}.zst", record.sha256)),
++    }
++}
++
++fn read_blob(root: &Path, record: &Record) -> io::Result<Vec<u8>> {
++    if record.bytes > MAX_BLOB_LOGICAL_BYTES {
++        return Err(invalid("CAS blob exceeds its bounded logical size"));
++    }
++    let file = File::open(blob_path(root, record))?;
++    let stored_bytes = file.metadata()?.len();
++    if record
++        .stored_bytes
++        .is_some_and(|expected| expected != stored_bytes)
++        || stored_bytes > MAX_BLOB_LOGICAL_BYTES + 1024 * 1024
++    {
++        return Err(invalid(
++            "CAS blob stored length does not match its manifest",
++        ));
++    }
++    let reader: Box<dyn Read> = match record.codec {
++        BlobCodec::Raw => Box::new(file),
++        BlobCodec::Zstd => Box::new(zstd::stream::read::Decoder::new(file)?),
++    };
++    let mut bytes = Vec::new();
++    reader.take(record.bytes + 1).read_to_end(&mut bytes)?;
++    if bytes.len() as u64 != record.bytes || digest(&bytes) != record.sha256 {
++        return Err(invalid(
++            "CAS inherited blob is truncated, oversized or corrupt",
++        ));
++    }
++    Ok(bytes)
++}
++
++fn publish_blob(root: &Path, record: &Record, bytes: &[u8]) -> io::Result<u64> {
++    if bytes.len() as u64 > MAX_BLOB_LOGICAL_BYTES {
++        return Err(invalid("CAS blob exceeds its bounded logical size"));
++    }
++    std::fs::create_dir_all(root)?;
++    let path = blob_path(root, record);
++    if path.exists() {
++        if read_blob(root, record)? != bytes {
++            return Err(invalid("CAS payload identity collision"));
++        }
++        return Ok(std::fs::metadata(path)?.len());
++    }
++    let mut temporary = tempfile::NamedTempFile::new_in(root)?;
++    let compressed = zstd::stream::encode_all(bytes, 3)?;
++    temporary.write_all(&compressed)?;
++    temporary.as_file().sync_all()?;
++    match temporary.persist_noclobber(&path) {
++        Ok(_) => {}
++        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
++            if read_blob(root, record)? != bytes {
++                return Err(invalid("CAS concurrent payload identity collision"));
++            }
++        }
++        Err(error) => return Err(error.error),
++    }
++    sync_directory(root)?;
++    Ok(std::fs::metadata(path)?.len())
++}
++
++/// Commits a transformed inherited record before the recorder acknowledges its append.
++pub(crate) fn append_prefix(path: &Path, ordinal: u64, json: &str) -> io::Result<()> {
++    let (head, _) = header(&mut File::open(path)?)?
++        .ok_or_else(|| invalid("CAS prefix write requires its durable rollout header"))?;
++    if ordinal == 0 || ordinal >= head.prefix_end_ordinal {
++        return Err(invalid(
++            "CAS prefix append is outside the inherited boundary",
++        ));
++    }
++    // Timestamp and ordinal are unique to this rollout. The opaque item suffix can be shared
++    // after the stock child transform, including all role and authorization bytes.
++    let split = json.find(",\"type\":").unwrap_or(0);
++    let (literal, shared) = json.split_at(split);
++    let mut record = Record {
++        ordinal,
++        literal: literal.to_owned(),
++        sha256: digest(shared.as_bytes()),
++        bytes: shared.len() as u64,
++        codec: BlobCodec::Zstd,
++        stored_bytes: None,
++    };
++    let (blobs, manifest) = paths(path)?;
++    let directory = manifest
++        .parent()
++        .ok_or_else(|| invalid("CAS manifest has no parent"))?;
++    std::fs::create_dir_all(directory)?;
++    let records = match read_records(&manifest) {
++        Ok(records) => records,
++        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
++        Err(error) => return Err(error),
++    };
++    if let Some(previous) = records.get((ordinal - 1) as usize) {
++        if previous.sha256 != record.sha256 || previous.bytes != record.bytes {
++            return Err(invalid("CAS prefix retry changed inherited content"));
++        }
++        read_blob(&blobs, previous)?;
++        File::options().write(true).open(&manifest)?.sync_all()?;
++        return Ok(());
++    }
++    if ordinal != records.len() as u64 + 1 {
++        return Err(invalid("CAS prefix append has an ordinal gap"));
++    }
++    record.stored_bytes = Some(publish_blob(&blobs, &record, shared.as_bytes())?);
++    let mut serialized = serde_json::to_vec(&record)?;
++    serialized.push(b'\n');
++    let mut file = File::options().create(true).append(true).open(&manifest)?;
++    file.write_all(&serialized)?;
++    file.sync_all()?;
++    sync_directory(directory)
++}
++
++pub(crate) fn assert_prefix_complete(path: &Path) -> io::Result<()> {
++    let (head, _) = header(&mut File::open(path)?)?
++        .ok_or_else(|| invalid("CAS tail write requires its durable rollout header"))?;
++    let (_, manifest) = paths(path)?;
++    if read_records(&manifest)?.len() as u64 + 1 != head.prefix_end_ordinal {
++        return Err(invalid(
++            "CAS inherited prefix is incomplete; refusing local tail append",
++        ));
++    }
++    Ok(())
++}
++
++/// Opens one immutable logical snapshot. Physical-tail length is captured before its manifest,
++/// so a first child-tail append cannot be observed without its preceding inherited context.
++pub(crate) fn logical_snapshot(
++    path: &Path,
++    is_cancelled: impl Fn() -> bool,
++) -> io::Result<Option<File>> {
++    let mut source = File::open(path)?;
++    if header(&mut source)?.is_none() {
++        return Ok(None);
++    }
++    Ok(Some(open_logical_file(path, source, is_cancelled)?))
++}
++
++/// Retains the already-open ordinary representation across concurrent compression/rename.
++pub(crate) fn open_logical_file(
++    path: &Path,
++    mut source: File,
++    is_cancelled: impl Fn() -> bool,
++) -> io::Result<File> {
++    let source_len = source.metadata()?.len();
++    let Some((head, physical_header_end)) = header(&mut source)? else {
++        source.rewind()?;
++        return Ok(source);
++    };
++    let (blobs, manifest) = paths(path)?;
++    let records = read_records(&manifest)?;
++    if records.len() as u64 >= head.prefix_end_ordinal {
++        return Err(invalid("CAS prefix exceeds its frozen inherited boundary"));
++    }
++    if source_len > physical_header_end && records.len() as u64 + 1 != head.prefix_end_ordinal {
++        return Err(invalid(
++            "CAS local tail exists before the inherited prefix is complete",
++        ));
++    }
++    let mut logical = tempfile::tempfile()?;
++    logical.write_all(head.logical_session_meta.as_bytes())?;
++    for record in records {
++        if is_cancelled() {
++            return Err(io::Error::other("rollout read cancelled"));
++        }
++        let bytes = read_blob(&blobs, &record)?;
++        logical.write_all(record.literal.as_bytes())?;
++        logical.write_all(&bytes)?;
++    }
++    source.seek(SeekFrom::Start(physical_header_end))?;
++    let mut remaining = source.take(source_len.saturating_sub(physical_header_end));
++    let mut buffer = [0; 64 * 1024];
++    loop {
++        if is_cancelled() {
++            return Err(io::Error::other("rollout read cancelled"));
++        }
++        let count = remaining.read(&mut buffer)?;
++        if count == 0 {
++            break;
++        }
++        logical.write_all(&buffer[..count])?;
++    }
++    logical.rewind()?;
++    Ok(logical)
++}
++
++/// Strong revision including the inherited manifest. Corrupt required data fails closed.
++pub fn steward_cas_revision(path: &Path) -> io::Result<Option<String>> {
++    if !is_steward_cas_rollout(path)? {
++        return Ok(None);
++    }
++    let (blobs, manifest) = paths(path)?;
++    let records = read_records(&manifest)?;
++    let mut hash = Sha256::new();
++    hash.update(std::fs::read(path)?);
++    hash.update(std::fs::read(manifest)?);
++    for record in records {
++        read_blob(&blobs, &record)?;
++    }
++    Ok(Some(format!("steward-cas-v1:{:x}", hash.finalize())))
++}
++
++/// Writes a new standalone plain-history export. The required-CAS source is never replaced.
++pub fn export_steward_cas_rollout(path: &Path, destination: &Path) -> io::Result<String> {
++    if destination.exists() {
++        return Err(io::Error::new(
++            io::ErrorKind::AlreadyExists,
++            "export destination exists",
++        ));
++    }
++    let mut logical = logical_snapshot(path, || false)?
++        .ok_or_else(|| invalid("export source is not a CAS rollout"))?;
++    let directory = destination
++        .parent()
++        .ok_or_else(|| invalid("export destination has no parent"))?;
++    std::fs::create_dir_all(directory)?;
++    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
++    io::copy(&mut logical, &mut temporary)?;
++    temporary.as_file().sync_all()?;
++    logical.rewind()?;
++    let mut source_hash = Sha256::new();
++    let mut exported_hash = Sha256::new();
++    let mut exported = File::open(temporary.path())?;
++    let mut buffer = [0; 64 * 1024];
++    loop {
++        let read = logical.read(&mut buffer)?;
++        if read == 0 {
++            break;
++        }
++        source_hash.update(&buffer[..read]);
++    }
++    loop {
++        let read = exported.read(&mut buffer)?;
++        if read == 0 {
++            break;
++        }
++        exported_hash.update(&buffer[..read]);
++    }
++    let expected = source_hash.finalize();
++    if expected != exported_hash.finalize() {
++        return Err(invalid("plain history export failed byte verification"));
++    }
++    temporary
++        .persist_noclobber(destination)
++        .map_err(|error| error.error)?;
++    sync_directory(directory)?;
++    Ok(format!("{expected:x}"))
++}
++
++/// Exercises the actual native storage codec in an isolated temporary home.
++/// This is deliberately narrower than full agent spawn/resume acceptance.
++pub fn steward_storage_self_test() -> io::Result<serde_json::Value> {
++    let home = tempfile::tempdir()?;
++    let directory = home.path().join("sessions/2026/11/08");
++    std::fs::create_dir_all(&directory)?;
++    let metadata = "{\"timestamp\":\"2026-11-08T00:00:00.000Z\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{\"history_mode\":\"paginated\"}}\n";
++    let payload =
++        "exact inherited content including user role and authorization ordering λ ".repeat(4096);
++    let mut original_bytes = 0;
++    let mut last = PathBuf::new();
++    for number in 0..2 {
++        let path = directory.join(format!("rollout-self-test-{number}.jsonl"));
++        std::fs::write(&path, wrap_session_meta(metadata, 2)?)?;
++        let inherited = format!(
++            "{{\"timestamp\":\"2026-11-08T00:00:00.00{number}Z\",\"ordinal\":1,\"type\":\"response_item\",\"payload\":{}}}\n",
++            serde_json::to_string(&payload)?
++        );
++        append_prefix(&path, 1, &inherited)?;
++        assert_prefix_complete(&path)?;
++        let expected = format!("{metadata}{inherited}");
++        let mut snapshot =
++            logical_snapshot(&path, || false)?.ok_or_else(|| invalid("missing test snapshot"))?;
++        let mut bytes = Vec::new();
++        snapshot.read_to_end(&mut bytes)?;
++        if bytes != expected.as_bytes() {
++            return Err(invalid("native storage self-test byte mismatch"));
++        }
++        original_bytes += expected.len();
++        last = path;
++    }
++    let (blobs, _) = paths(&last)?;
++    let shared_blob_bytes: u64 = std::fs::read_dir(blobs)?
++        .map(|entry| {
++            entry
++                .and_then(|entry| entry.metadata())
++                .map(|metadata| metadata.len())
++        })
++        .sum::<io::Result<_>>()?;
++    if shared_blob_bytes >= original_bytes as u64 * 3 / 4 {
++        return Err(invalid("native storage self-test found no sibling reuse"));
++    }
++    let export = home.path().join("export.jsonl");
++    export_steward_cas_rollout(&last, &export)?;
++    let mut logical = logical_snapshot(&last, || false)?.unwrap();
++    let mut expected = Vec::new();
++    logical.read_to_end(&mut expected)?;
++    if std::fs::read(export)? != expected {
++        return Err(invalid("native self-test export mismatch"));
++    }
++    Ok(serde_json::json!({
++        "capability": "steward-cas-child-prefix-v1",
++        "scope": "legacy_and_paginated_child_inherited_prefix",
++        "codec_self_test_passed": true,
++        "exact_bytes_verified": true,
++        "sibling_payload_reuse_verified": true,
++        "plain_export_verified": true,
++        "blob_codec": "zstd_level_3",
++        "logical_bytes_in_two_children": original_bytes,
++        "shared_blob_bytes": shared_blob_bytes,
++        "full_spawn_resume_verified": false,
++        "production_ready": false
++    }))
++}
++
++#[cfg(test)]
++#[path = "steward_cas/tests.rs"]
++mod tests;
+diff --git a/codex-rs/rollout/src/steward_cas/tests.rs b/codex-rs/rollout/src/steward_cas/tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..2293f9b972b8612480a729ae5bdf565164f5bad8
+--- /dev/null
++++ b/codex-rs/rollout/src/steward_cas/tests.rs
+@@ -0,0 +1,312 @@
++use super::*;
++
++fn child(home: &Path, name: &str, end: u64) -> io::Result<PathBuf> {
++    let dir = home.join("sessions/2026/11/08");
++    std::fs::create_dir_all(&dir)?;
++    let path = dir.join(format!("rollout-{name}.jsonl"));
++    std::fs::write(&path, wrap_session_meta(meta(), end)?)?;
++    Ok(path)
++}
++
++fn meta() -> &'static str {
++    "{\"timestamp\":\"2026-11-08T00:00:00.000Z\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{\"history_mode\":\"paginated\"}}\n"
++}
++
++fn line(ordinal: u64, timestamp: &str, text: &str) -> String {
++    format!(
++        "{{\"timestamp\":\"{timestamp}\",\"ordinal\":{ordinal},\"type\":\"response_item\",\"payload\":{{\"role\":\"user\",\"text\":{}}}}}\n",
++        serde_json::to_string(text).unwrap()
++    )
++}
++
++fn bytes(path: &Path) -> io::Result<Vec<u8>> {
++    let mut result = Vec::new();
++    logical_snapshot(path, || false)?
++        .unwrap()
++        .read_to_end(&mut result)?;
++    Ok(result)
++}
++
++#[test]
++fn exact_bytes_and_shared_payloads_across_children() -> io::Result<()> {
++    let home = tempfile::tempdir()?;
++    let first = child(home.path(), "first", 3)?;
++    let second = child(home.path(), "second", 3)?;
++    let payload =
++        "transformed user context; authorization stays in stock order; λ\\n\"".repeat(4096);
++    let one = line(1, "2026-11-08T01:00:00.001Z", &payload);
++    let two = line(
++        2,
++        "2026-11-08T01:00:00.002Z",
++        "guardian context remains absent",
++    );
++    append_prefix(&first, 1, &one)?;
++    append_prefix(&first, 2, &two)?;
++    let other_one = line(1, "2026-11-08T02:00:00.001Z", &payload);
++    let other_two = line(
++        2,
++        "2026-11-08T02:00:00.002Z",
++        "guardian context remains absent",
++    );
++    append_prefix(&second, 1, &other_one)?;
++    append_prefix(&second, 2, &other_two)?;
++    let tail = line(3, "2026-11-08T03:00:00.001Z", "child only");
++    assert_prefix_complete(&first)?;
++    File::options()
++        .append(true)
++        .open(&first)?
++        .write_all(tail.as_bytes())?;
++    assert_eq!(
++        bytes(&first)?,
++        [meta(), &one, &two, &tail].concat().as_bytes()
++    );
++    assert_eq!(
++        bytes(&second)?,
++        [meta(), &other_one, &other_two].concat().as_bytes()
++    );
++    let (blobs, _) = paths(&first)?;
++    assert_eq!(std::fs::read_dir(&blobs)?.count(), 2);
++    let physical: u64 = std::fs::read_dir(blobs)?
++        .map(|entry| entry.unwrap().metadata().unwrap().len())
++        .sum();
++    assert!(physical < (one.len() + other_one.len()) as u64 * 3 / 4);
++    Ok(())
++}
++
++#[test]
++fn transformed_roles_and_authorization_are_not_normalized() -> io::Result<()> {
++    let home = tempfile::tempdir()?;
++    let path = child(home.path(), "roles", 2)?;
++    let transformed = line(
++        1,
++        "2026-11-08T00:00:00.001Z",
++        "developer converted to user; approval A then B; guardian removed",
++    );
++    append_prefix(&path, 1, &transformed)?;
++    assert_eq!(bytes(&path)?, [meta(), &transformed].concat().as_bytes());
++    let changed = transformed.replace("approval A then B", "approval B then A");
++    assert!(append_prefix(&path, 1, &changed).is_err());
++    Ok(())
++}
++
++#[test]
++fn retries_preserve_first_exact_header_bytes() -> io::Result<()> {
++    let home = tempfile::tempdir()?;
++    let path = child(home.path(), "retry", 2)?;
++    let original = line(1, "2026-11-08T00:00:00.001Z", "same item");
++    append_prefix(&path, 1, &original)?;
++    append_prefix(&path, 1, &line(1, "2026-11-08T00:00:00.999Z", "same item"))?;
++    assert_eq!(bytes(&path)?, [meta(), &original].concat().as_bytes());
++    Ok(())
++}
++
++#[test]
++fn missing_manifest_blob_and_corruption_fail_closed() -> io::Result<()> {
++    let home = tempfile::tempdir()?;
++    let path = child(home.path(), "missing", 2)?;
++    assert!(logical_snapshot(&path, || false).is_err());
++    append_prefix(&path, 1, &line(1, "now", "original"))?;
++    let (blobs, manifest) = paths(&path)?;
++    let record = read_records(&manifest)?.remove(0);
++    std::fs::write(blob_path(&blobs, &record), b"corrupt")?;
++    assert!(logical_snapshot(&path, || false).is_err());
++    assert!(steward_cas_revision(&path).is_err());
++    std::fs::remove_file(blob_path(&blobs, &record))?;
++    assert!(logical_snapshot(&path, || false).is_err());
++    Ok(())
++}
++
++#[test]
++fn incomplete_prefix_cannot_publish_local_tail_or_resume_as_complete() -> io::Result<()> {
++    let home = tempfile::tempdir()?;
++    let path = child(home.path(), "incomplete", 3)?;
++    append_prefix(&path, 1, &line(1, "now", "first"))?;
++    assert!(assert_prefix_complete(&path).is_err());
++    File::options()
++        .append(true)
++        .open(&path)?
++        .write_all(line(3, "now", "tail").as_bytes())?;
++    assert!(logical_snapshot(&path, || false).is_err());
++    Ok(())
++}
++
++#[test]
++fn partial_manifest_is_not_accepted_as_valid_eof() -> io::Result<()> {
++    let home = tempfile::tempdir()?;
++    let path = child(home.path(), "partial", 3)?;
++    append_prefix(&path, 1, &line(1, "now", "first"))?;
++    let (_, manifest) = paths(&path)?;
++    File::options()
++        .append(true)
++        .open(manifest)?
++        .write_all(b"{\"ordinal\":2")?;
++    assert!(logical_snapshot(&path, || false).is_err());
++    Ok(())
++}
++
++#[test]
++fn prefix_changes_revision_and_same_length_tail_edits_change_it() -> io::Result<()> {
++    let home = tempfile::tempdir()?;
++    let path = child(home.path(), "revision", 3)?;
++    append_prefix(&path, 1, &line(1, "now", "first"))?;
++    let one = steward_cas_revision(&path)?;
++    append_prefix(&path, 2, &line(2, "now", "second"))?;
++    let two = steward_cas_revision(&path)?;
++    assert_ne!(one, two);
++    File::options()
++        .append(true)
++        .open(&path)?
++        .write_all(b"tail-A")?;
++    let three = steward_cas_revision(&path)?;
++    let mut file = File::options().write(true).open(&path)?;
++    file.seek(SeekFrom::End(-1))?;
++    file.write_all(b"B")?;
++    assert_ne!(three, steward_cas_revision(&path)?);
++    Ok(())
++}
++
++#[test]
++fn archive_and_parent_deletion_preserve_context_and_offsets() -> io::Result<()> {
++    let home = tempfile::tempdir()?;
++    let path = child(home.path(), "archive", 2)?;
++    let parent = home.path().join("parent.jsonl");
++    std::fs::write(&parent, b"parent original history")?;
++    let context = line(1, "now", "inherited parent bytes");
++    append_prefix(&path, 1, &context)?;
++    let expected = bytes(&path)?;
++    std::fs::remove_file(parent)?;
++    let archive = home.path().join("archived_sessions");
++    std::fs::create_dir_all(&archive)?;
++    let archived = archive.join(path.file_name().unwrap());
++    std::fs::rename(&path, &archived)?;
++    let mut logical = logical_snapshot(&archived, || false)?.unwrap();
++    logical.seek(SeekFrom::Start(meta().len() as u64))?;
++    let mut suffix = Vec::new();
++    logical.read_to_end(&mut suffix)?;
++    assert_eq!(suffix, context.as_bytes());
++    assert_eq!(bytes(&archived)?, expected);
++    assert!(logical_snapshot(&archived, || true).is_err());
++    Ok(())
++}
++
++#[test]
++fn ordinary_jsonl_remains_ordinary() -> io::Result<()> {
++    let home = tempfile::tempdir()?;
++    let path = home.path().join("ordinary.jsonl");
++    std::fs::write(&path, meta())?;
++    assert!(!is_steward_cas_rollout(&path)?);
++    assert!(logical_snapshot(&path, || false)?.is_none());
++    assert!(steward_cas_revision(&path)?.is_none());
++    Ok(())
++}
++
++#[test]
++fn compressed_blobs_bind_logical_and_stored_lengths() -> io::Result<()> {
++    let home = tempfile::tempdir()?;
++    let path = child(home.path(), "zstd", 2)?;
++    let inherited = line(1, "now", &"lossless payload λ ".repeat(16384));
++    append_prefix(&path, 1, &inherited)?;
++    let (blobs, manifest) = paths(&path)?;
++    let mut record = read_records(&manifest)?.remove(0);
++    assert!(matches!(record.codec, BlobCodec::Zstd));
++    assert!(record.stored_bytes.unwrap() < record.bytes / 4);
++    assert!(read_blob(&blobs, &record).is_ok());
++    record.stored_bytes = Some(record.stored_bytes.unwrap() + 1);
++    assert!(read_blob(&blobs, &record).is_err());
++    record.stored_bytes = None;
++    record.bytes -= 1;
++    assert!(read_blob(&blobs, &record).is_err());
++    record.bytes = MAX_BLOB_LOGICAL_BYTES + 1;
++    assert!(read_blob(&blobs, &record).is_err());
++    assert_eq!(bytes(&path)?, [meta(), &inherited].concat().as_bytes());
++    Ok(())
++}
++
++#[test]
++fn earlier_raw_blob_manifest_reconstructs_without_reencoding() -> io::Result<()> {
++    let home = tempfile::tempdir()?;
++    let path = child(home.path(), "raw", 2)?;
++    let inherited = line(1, "now", "raw payload remains exact");
++    let split = inherited.find(",\"type\":").unwrap();
++    let (literal, shared) = inherited.split_at(split);
++    let (blobs, manifest) = paths(&path)?;
++    std::fs::create_dir_all(&blobs)?;
++    std::fs::create_dir_all(manifest.parent().unwrap())?;
++    let hash = digest(shared.as_bytes());
++    std::fs::write(blobs.join(&hash), shared)?;
++    let record =
++        serde_json::json!({"ordinal":1,"literal":literal,"sha256":hash,"bytes":shared.len()});
++    std::fs::write(manifest, format!("{record}\n"))?;
++    assert_eq!(bytes(&path)?, [meta(), &inherited].concat().as_bytes());
++    Ok(())
++}
++
++#[test]
++fn metadata_header_retry_preserves_first_timestamp_and_rejects_changed_metadata() -> io::Result<()>
++{
++    let home = tempfile::tempdir()?;
++    let path = child(home.path(), "header", 2)?;
++    let before = std::fs::read(&path)?;
++    let retried = meta().replace("00:00:00.000Z", "00:00:00.999Z");
++    assert!(header_already_published(&path, &retried, 2)?);
++    assert_eq!(std::fs::read(&path)?, before);
++    assert!(header_already_published(&path, &meta().replace("paginated", "legacy"), 2).is_err());
++    assert!(header_already_published(&path, meta(), 3).is_err());
++    Ok(())
++}
++
++#[test]
++fn built_in_self_test_reports_its_narrow_scope() -> io::Result<()> {
++    let result = steward_storage_self_test()?;
++    assert_eq!(result["codec_self_test_passed"], true);
++    assert_eq!(result["plain_export_verified"], true);
++    assert_eq!(result["full_spawn_resume_verified"], false);
++    assert_eq!(result["production_ready"], false);
++    Ok(())
++}
++
++#[test]
++fn plain_export_is_exact_and_never_clobbers_a_destination() -> io::Result<()> {
++    let home = tempfile::tempdir()?;
++    let path = child(home.path(), "export", 2)?;
++    append_prefix(&path, 1, &line(1, "now", "opaque original"))?;
++    let before = std::fs::read(&path)?;
++    let exported = home.path().join("plain/export.jsonl");
++    let checksum = export_steward_cas_rollout(&path, &exported)?;
++    assert_eq!(std::fs::read(&exported)?, bytes(&path)?);
++    assert_eq!(digest(&std::fs::read(&exported)?), checksum);
++    assert!(export_steward_cas_rollout(&path, &exported).is_err());
++    assert_eq!(std::fs::read(path)?, before);
++    Ok(())
++}
++
++#[test]
++fn concurrent_siblings_publish_one_immutable_shared_blob() -> io::Result<()> {
++    let home = tempfile::tempdir()?;
++    let paths: Vec<_> = (0..8)
++        .map(|number| child(home.path(), &format!("parallel-{number}"), 2))
++        .collect::<io::Result<_>>()?;
++    let workers: Vec<_> = paths
++        .iter()
++        .cloned()
++        .map(|path| {
++            std::thread::spawn(move || {
++                append_prefix(
++                    &path,
++                    1,
++                    &line(1, "now", &"same inherited context".repeat(8192)),
++                )
++            })
++        })
++        .collect();
++    for worker in workers {
++        worker.join().unwrap()?;
++    }
++    let (blobs, _) = super::paths(&paths[0])?;
++    assert_eq!(std::fs::read_dir(blobs)?.count(), 1);
++    let expected = bytes(&paths[0])?;
++    for path in paths {
++        assert_eq!(bytes(&path)?, expected);
++    }
++    Ok(())
++}
+diff --git a/codex-rs/thread-store/src/local/history_revision.rs b/codex-rs/thread-store/src/local/history_revision.rs
+index ad241a49a24f5c4eaccda1371f102069f3d1f8bd..347c43bc520cc2505ac8dfb701fa3f306149c23e 100644
+--- a/codex-rs/thread-store/src/local/history_revision.rs
++++ b/codex-rs/thread-store/src/local/history_revision.rs
+@@ -9,6 +9,17 @@ use std::path::Path;
+ pub(super) async fn read(path: &Path) -> Option<String> {
+     let path = codex_rollout::existing_rollout_path(path).await?;
+     let path = tokio::fs::canonicalize(path).await.ok()?;
++    // A CAS child can append inherited context without changing the physical tail. Bind the
++    // revision to both representations, and disable snapshot reuse on every inspection failure.
++    let cas_path = path.clone();
++    if let Some(revision) =
++        tokio::task::spawn_blocking(move || codex_rollout::steward_cas_revision(&cas_path))
++            .await
++            .ok()?
++            .ok()?
++    {
++        return serde_json::to_string(&("local-steward-cas-v1", path, revision)).ok();
++    }
+     let metadata = tokio::fs::metadata(&path).await.ok()?;
+     let modified = metadata.modified().ok()?;
+     let created = metadata.created().ok();
+@@ -26,3 +37,66 @@ pub(super) async fn read(path: &Path) -> Option<String> {
+     let identity: Option<(u64, u64, i64, i64)> = None;
+     serde_json::to_string(&("local", path, metadata.len(), modified, created, identity)).ok()
+ }
++
++#[cfg(test)]
++mod tests {
++    use std::fs;
++
++    use serde_json::json;
++    use tempfile::TempDir;
++    use uuid::Uuid;
++
++    use super::read;
++    use crate::local::test_support::write_steward_cas_session_file;
++
++    #[tokio::test]
++    async fn cas_manifest_append_changes_revision_without_changing_physical_tail() {
++        let home = TempDir::new().expect("Codex home");
++        let path =
++            write_steward_cas_session_file(home.path(), "2025-01-03T12-00-00", Uuid::new_v4())
++                .expect("CAS child fixture");
++        let physical = fs::read(&path).expect("physical tail");
++        let before = read(&path).await.expect("initial CAS revision");
++        let shared = b"shared bytes\n";
++        // SHA-256 of the exact opaque fixture bytes, including their final newline.
++        let digest = "ee392e7ce57b7406be2939363d0c2acfd7116af1a8085876355e605a342dfa13";
++        let blobs = home.path().join("steward-cas-v1/blobs");
++        fs::create_dir_all(&blobs).expect("blob directory");
++        fs::write(blobs.join(digest), shared).expect("shared blob");
++        let manifest = home
++            .path()
++            .join("steward-cas-v1/prefixes")
++            .join(path.file_name().expect("rollout filename"))
++            .with_extension("jsonl.prefix");
++        let record = json!({
++            "ordinal": 1,
++            "literal": "unique rollout timestamp",
++            "sha256": digest,
++            "bytes": shared.len(),
++        });
++        fs::write(&manifest, format!("{record}\n")).expect("publish inherited record");
++        let after = read(&path).await.expect("updated CAS revision");
++        assert_ne!(before, after);
++        assert_eq!(fs::read(&path).expect("unchanged physical tail"), physical);
++        fs::write(blobs.join(digest), b"corrupt blob").expect("simulate corruption");
++        assert!(
++            read(&path).await.is_none(),
++            "corrupt CAS data disables reuse"
++        );
++    }
++
++    #[tokio::test]
++    async fn required_cas_without_manifest_never_has_a_reusable_revision() {
++        let home = TempDir::new().expect("Codex home");
++        let path =
++            write_steward_cas_session_file(home.path(), "2025-01-03T12-00-00", Uuid::new_v4())
++                .expect("CAS child fixture");
++        let manifest = home
++            .path()
++            .join("steward-cas-v1/prefixes")
++            .join(path.file_name().expect("rollout filename"))
++            .with_extension("jsonl.prefix");
++        fs::remove_file(manifest).expect("simulate lost manifest");
++        assert!(read(&path).await.is_none());
++    }
++}
+diff --git a/codex-rs/thread-store/src/local/mod.rs b/codex-rs/thread-store/src/local/mod.rs
+index f4647d18a09edd2c8530bccda54a4817d6630fa8..34d2ad57d897c03d7bf31d145c7cba55a710ac63 100644
+--- a/codex-rs/thread-store/src/local/mod.rs
++++ b/codex-rs/thread-store/src/local/mod.rs
+@@ -361,8 +361,35 @@ impl LocalThreadStore {
+         {
+             return Ok(None);
+         }
++        // Feedback uploads consume a physical file rather than the logical rollout reader.
++        // Sending a CAS child's tail alone would silently omit its inherited context.
++        let rollout_path = recorder.rollout_path().to_path_buf();
++        let inspection_path = rollout_path.clone();
++        let is_cas = tokio::task::spawn_blocking(move || {
++            codex_rollout::is_steward_cas_rollout(&inspection_path)
++        })
++        .await
++        .map_err(|error| ThreadStoreError::Internal {
++            message: format!("failed to inspect feedback rollout: {error}"),
++        })?
++        .or_else(|error| {
++            if error.kind() == std::io::ErrorKind::NotFound {
++                // Preserve collection's existing missing-file diagnostic for deleted rollouts.
++                Ok(false)
++            } else {
++                Err(error)
++            }
++        })
++        .map_err(|error| ThreadStoreError::Internal {
++            message: format!("failed to inspect feedback rollout: {error}"),
++        })?;
++        if is_cas {
++            return Err(ThreadStoreError::InvalidRequest {
++                message: "CAS rollout feedback requires a verified plain-history export; the physical child tail cannot be attached directly".to_string(),
++            });
++        }
+         // Keep the path even if a materialized file was deleted: collection must report that error.
+-        Ok(Some(recorder.rollout_path().to_path_buf()))
++        Ok(Some(rollout_path))
+     }
+ 
+     pub(super) async fn ensure_live_recorder_absent(
+@@ -1012,6 +1039,48 @@ mod tests {
+         );
+     }
+ 
++    #[tokio::test]
++    async fn feedback_rejects_cas_physical_tail_attachment() {
++        let home = TempDir::new().expect("Codex home");
++        let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
++        let thread_id = ThreadId::new();
++        store
++            .create_thread(create_thread_params(thread_id))
++            .await
++            .expect("create live thread");
++        store
++            .persist_thread(thread_id, PersistContext::Standard)
++            .await
++            .expect("materialize session metadata");
++        let path = store
++            .live_rollout_path(thread_id)
++            .await
++            .expect("rollout path");
++        let logical = std::fs::read_to_string(&path).expect("plain session metadata");
++        let physical = serde_json::json!({
++            "steward_cas_v1": {
++                "logical_session_meta": logical,
++                "prefix_end_ordinal": 2,
++            }
++        });
++        std::fs::write(&path, format!("{physical}\n")).expect("required CAS header");
++        let before = std::fs::read(&path).expect("physical child tail");
++        let error = store
++            .feedback_rollout_path(thread_id)
++            .await
++            .expect_err("feedback must not attach an incomplete physical child tail");
++        assert!(matches!(error, ThreadStoreError::InvalidRequest { message }
++                if message.contains("verified plain-history export")));
++        assert_eq!(
++            std::fs::read(&path).expect("unchanged physical tail"),
++            before
++        );
++        store
++            .shutdown_thread(thread_id)
++            .await
++            .expect("shutdown recorder");
++    }
++
+     #[tokio::test]
+     async fn raw_append_items_does_not_update_sqlite_metadata() {
+         // This pins the ThreadStore contract: raw appends are history-only. Callers that need
+diff --git a/codex-rs/thread-store/src/local/rollout_migration.rs b/codex-rs/thread-store/src/local/rollout_migration.rs
+index 968af560a0d80b1d2cda1219ce268b510af15337..619aff24b4ad63c4eb812b7cae5e5652b10a8984 100644
+--- a/codex-rs/thread-store/src/local/rollout_migration.rs
++++ b/codex-rs/thread-store/src/local/rollout_migration.rs
+@@ -499,6 +499,20 @@ impl LocalThreadStore {
+         if !matches_selection(&options.thread_ids, Some(thread_id)) {
+             return Ok(None);
+         }
++        // Migration canonicalizers still consume a physical JSONL file. Refuse CAS input before
++        // staging, projection, or publication can replace a child with only its physical tail.
++        let inspection_path = path.clone();
++        let is_cas = tokio::task::spawn_blocking(move || {
++            codex_rollout::is_steward_cas_rollout(&inspection_path)
++        })
++        .await
++        .map_err(migration_error)?
++        .map_err(migration_error)?;
++        if is_cas {
++            return Err(ThreadStoreError::InvalidRequest {
++                message: "CAS rollout migration requires a verified plain-history export; materialize the complete logical history before migrating".to_string(),
++            });
++        }
+         let is_memory_consolidation = matches!(
+             metadata.meta.source,
+             SessionSource::Internal(InternalSessionSource::MemoryConsolidation)
+diff --git a/codex-rs/thread-store/src/local/rollout_migration_tests.rs b/codex-rs/thread-store/src/local/rollout_migration_tests.rs
+index 11a26265bd415b134aef4c1353a771dc4083a999..6812298ff973076630313fd11464d85b768b7c77 100644
+--- a/codex-rs/thread-store/src/local/rollout_migration_tests.rs
++++ b/codex-rs/thread-store/src/local/rollout_migration_tests.rs
+@@ -3373,3 +3373,38 @@ async fn migration_skips_malformed_lines_and_trailing_partial_tail() {
+     assert_eq!(turns.turns.len(), 1);
+     assert_eq!(turns.turns[0].items.len(), 2);
+ }
++
++#[tokio::test]
++async fn migration_rejects_cas_before_rewriting_or_projecting_its_tail() {
++    let home = TempDir::new().expect("create Codex home");
++    let path = crate::local::test_support::write_steward_cas_session_file(
++        home.path(),
++        "2025-01-03T12-00-00",
++        uuid::Uuid::new_v4(),
++    )
++    .expect("CAS child fixture");
++    let original = fs::read(&path).expect("physical rollout");
++    let store = LocalThreadStore::new(test_config(home.path()), /*state_db*/ None);
++    let error = store
++        .migrate_rollouts(apply_options())
++        .await
++        .expect_err("CAS migration must require a complete plain export");
++    assert!(matches!(error, ThreadStoreError::InvalidRequest { message }
++            if message.contains("verified plain-history export")));
++    assert_eq!(
++        fs::read(&path).expect("preserved physical rollout"),
++        original
++    );
++    assert!(
++        !migration_journal_path(
++            home.path(),
++            codex_rollout::read_session_meta_line(&path)
++                .await
++                .expect("logical metadata")
++                .meta
++                .id
++        )
++        .exists(),
++        "CAS rejection must happen before a migration journal is created"
++    );
++}
+diff --git a/codex-rs/thread-store/src/local/test_support.rs b/codex-rs/thread-store/src/local/test_support.rs
+index ddaf7eece265f5d9f12ba5a5e9ec5f41f59aa931..efc488433e69c5926af690106a9a74f931231b7f 100644
+--- a/codex-rs/thread-store/src/local/test_support.rs
++++ b/codex-rs/thread-store/src/local/test_support.rs
+@@ -39,6 +39,32 @@ pub(super) fn write_session_file_with_history_mode(
+     )
+ }
+ 
++/// A required-CAS child header with an initially empty, durable prefix manifest.
++pub(super) fn write_steward_cas_session_file(
++    root: &Path,
++    ts: &str,
++    uuid: Uuid,
++) -> std::io::Result<PathBuf> {
++    let path = write_session_file_with_history_mode(root, ts, uuid, ThreadHistoryMode::Paginated)?;
++    let mut session_meta: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
++    session_meta["payload"]["subagent_history_start_ordinal"] = serde_json::json!(2);
++    let logical_session_meta = format!("{session_meta}\n");
++    let header = serde_json::json!({
++        "steward_cas_v1": {
++            "logical_session_meta": logical_session_meta,
++            "prefix_end_ordinal": 2,
++        }
++    });
++    fs::write(&path, format!("{header}\n"))?;
++    let manifest = root
++        .join("steward-cas-v1/prefixes")
++        .join(path.file_name().expect("session filename"))
++        .with_extension("jsonl.prefix");
++    fs::create_dir_all(manifest.parent().expect("manifest directory"))?;
++    fs::write(manifest, b"")?;
++    Ok(path)
++}
++
+ pub(super) fn write_archived_session_file(
+     root: &Path,
+     ts: &str,
+diff --git a/codex-rs/thread-store/src/local/thread_history_materialization_tests.rs b/codex-rs/thread-store/src/local/thread_history_materialization_tests.rs
+index 3cfa0e50309e7bd7c85a421e29127eeb4644cfe2..121a236a07f9016acb603b00e7e680cdb05a2379 100644
+--- a/codex-rs/thread-store/src/local/thread_history_materialization_tests.rs
++++ b/codex-rs/thread-store/src/local/thread_history_materialization_tests.rs
+@@ -3235,7 +3235,10 @@ fn agent_message(id: &str, phase: MessagePhase) -> TurnItem {
+ }
+ 
+ fn rollout_line_byte_offsets(path: &std::path::Path, ordinal: u64) -> (i64, i64) {
+-    let bytes = fs::read(path).expect("read rollout");
++    let mut reader = codex_rollout::open_rollout_seekable_reader(path, || false)
++        .expect("open logical rollout for offset assertions");
++    let mut bytes = Vec::new();
++    std::io::Read::read_to_end(&mut reader, &mut bytes).expect("read logical rollout");
+     let mut start_byte_offset = 0;
+     for line in bytes.split_inclusive(|byte| *byte == b'\n') {
+         let end_byte_offset = start_byte_offset + line.len();
